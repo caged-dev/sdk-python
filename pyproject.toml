@@ -1,5 +1,5 @@
 [project]
-name = "caged"
+name = "caged-sdk"
 version = "0.2.0"
 description = "Official Python SDK for the Caged AI Agent Sandbox Platform"
 readme = "README.md"

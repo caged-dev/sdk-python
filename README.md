@@ -8,7 +8,7 @@ Official Python SDK for the [Caged](https://caged.dev) AI Agent Sandbox Platform
 ## Installation
 
 ```bash
-pip install caged
+pip install caged-sdk
 ```
 
 ## Quick Start
