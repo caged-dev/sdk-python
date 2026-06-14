@@ -2,17 +2,31 @@
 
 from caged.client import Caged
 from caged.errors import CagedError, CagedAPIError, CagedTimeoutError
+from caged.mcp import MCPClient, MCPError, MCPTool, MCPResource, MCPPrompt
+from caged.stream import ExecStream
+from caged.terminal import TerminalSession
 from caged.types import (
+    AgentSession,
+    Alert,
+    AlertRule,
+    APIKey,
+    EventPayload,
     ExecResult,
+    FileEntry,
+    IngestResponse,
+    LogEntry,
+    Notification,
+    NotificationConfig,
+    Port,
+    ReplayEvent,
+    ReplaySummary,
     Sandbox,
     SandboxCreateParams,
-    FileEntry,
+    Session,
     Snapshot,
     SnapshotCreateParams,
-    APIKey,
-    Session,
+    Subscription,
     TrustScore,
-    Port,
 )
 
 __version__ = "0.2.0"
@@ -21,14 +35,34 @@ __all__ = [
     "CagedError",
     "CagedAPIError",
     "CagedTimeoutError",
+    # WebSocket
+    "TerminalSession",
+    "MCPClient",
+    "MCPError",
+    "MCPTool",
+    "MCPResource",
+    "MCPPrompt",
+    "ExecStream",
+    # Types
+    "AgentSession",
+    "Alert",
+    "AlertRule",
+    "APIKey",
+    "EventPayload",
     "ExecResult",
+    "FileEntry",
+    "IngestResponse",
+    "LogEntry",
+    "Notification",
+    "NotificationConfig",
+    "Port",
+    "ReplayEvent",
+    "ReplaySummary",
     "Sandbox",
     "SandboxCreateParams",
-    "FileEntry",
+    "Session",
     "Snapshot",
     "SnapshotCreateParams",
-    "APIKey",
-    "Session",
+    "Subscription",
     "TrustScore",
-    "Port",
 ]

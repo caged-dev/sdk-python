@@ -1,6 +1,6 @@
 [project]
 name = "caged"
-version = "0.1.0"
+version = "0.2.0"
 description = "Official Python SDK for the Caged AI Agent Sandbox Platform"
 readme = "README.md"
 license = "MIT"
@@ -18,7 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Typing :: Typed",
 ]
-dependencies = ["httpx>=0.25.0"]
+dependencies = ["httpx>=0.25.0", "websockets>=12.0"]
 
 [project.urls]
 Homepage = "https://caged.dev"
