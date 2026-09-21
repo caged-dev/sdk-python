@@ -6,12 +6,6 @@ on:
       - 'v*'
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to publish (e.g. 0.2.0)'
-        required: false
-        default: ''
 
 jobs:
   publish:
@@ -20,7 +14,7 @@ jobs:
     environment: pypi
     permissions:
       contents: read
-      id-token: write
+      id-token: write   # trusted publishing; there is no API token
 
     steps:
       - uses: actions/checkout@v4
@@ -29,34 +23,53 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install build tools
-        run: pip install build twine
-
-      - name: Update version (manual dispatch)
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+      - name: Install
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
-          sed -i "s/^__version__ = .*/__version__ = \"$VERSION\"/" caged/__init__.py
+          python -m pip install --upgrade pip build twine
+          pip install -e ".[dev]"
 
-      - name: Set version from release tag
-        if: github.event_name == 'release'
-        run: |
-          TAG="${{ github.event.release.tag_name }}"
-          VERSION="${TAG#v}"
-          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
-          sed -i "s/^__version__ = .*/__version__ = \"$VERSION\"/" caged/__init__.py
-
-      - name: Set version from pushed tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      # The tag names the release; the source declares the version. If they
+      # disagree, that is a mistake to stop on, not to paper over.
+      #
+      # This step used to rewrite the version into the source at publish
+      # time -- against `^version = ` in pyproject.toml and `__version__` in
+      # caged/__init__.py, neither of which is where the version lives any
+      # more, so it silently did nothing. An artifact whose version was
+      # edited in by CI matches no commit, which is the shape of how 0.2.0
+      # shipped 0.1.0's code under a new number.
+      - name: Check the tag matches caged/_version.py
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
-          sed -i "s/^__version__ = .*/__version__ = \"$VERSION\"/" caged/__init__.py
+          TAG_VERSION="${TAG#v}"
+          SOURCE_VERSION="$(python -c 'from caged._version import __version__; print(__version__)')"
+          echo "tag=$TAG_VERSION source=$SOURCE_VERSION"
+          if [ "$TAG_VERSION" != "$SOURCE_VERSION" ]; then
+            echo "::error::tag $TAG_VERSION does not match caged/_version.py ($SOURCE_VERSION)"
+            exit 1
+          fi
+
+      # Nothing is published that has not passed the same gates as a PR.
+      - name: Lint
+        run: ruff check caged/ tests/ scripts/
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        run: pytest -v
 
       - name: Build
         run: python -m build
+
+      # Against the installed artifact, not the working tree: checking the
+      # source proves nothing about what `pip install` hands anyone.
+      - name: Inspect the artifact
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          twine check dist/*
+          python -m venv /tmp/verify
+          /tmp/verify/bin/pip install --quiet dist/*.whl
+          /tmp/verify/bin/python scripts/verify_wheel.py "${TAG#v}"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
