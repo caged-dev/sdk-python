@@ -17,9 +17,9 @@ built from a real response at all.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from collections.abc import Mapping
 from typing import Any, Literal, TypeVar
 
 SandboxStatus = Literal["pending", "running", "paused", "stopped", "error", "destroyed"]

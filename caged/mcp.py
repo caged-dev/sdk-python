@@ -21,6 +21,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
@@ -261,10 +262,8 @@ class MCPClient:
             await self._ws.close()
             if self._listen_task:
                 self._listen_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await self._listen_task
-                except asyncio.CancelledError:
-                    pass
 
 
 def _field(result: Any, key: str) -> Any:

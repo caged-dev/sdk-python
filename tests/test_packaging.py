@@ -14,7 +14,7 @@ from pathlib import Path
 
 if sys.version_info >= (3, 11):
     import tomllib
-else:  # 3.9 is the floor in requires-python; tomllib is stdlib only from 3.11.
+else:  # 3.10 is the floor in requires-python; tomllib is stdlib only from 3.11.
     import tomli as tomllib
 
 from caged._version import __version__

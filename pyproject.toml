@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Official Python SDK for the Caged AI Agent Sandbox Platform"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Bytangle Ltd", email = "hello@caged.dev" }]
 keywords = ["caged", "sandbox", "ai", "agent", "firecracker", "microvm"]
 classifiers = [
@@ -16,7 +16,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -32,7 +31,7 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.5",
     # tests/test_packaging.py reads this file. tomllib is stdlib from 3.11 and
-    # the matrix still covers 3.9.
+    # the matrix still covers 3.10.
     "tomli>=2.0; python_version < '3.11'",
 ]
 
@@ -67,7 +66,7 @@ filterwarnings = ["error::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "N"]
@@ -78,7 +77,10 @@ select = ["E", "F", "I", "UP", "B", "SIM", "N"]
 "tests/test_client.py" = ["E501"]
 
 [tool.mypy]
-python_version = "3.9"
+# 3.10 is the floor requires-python declares. It is also the oldest version
+# mypy will type-check at all now, which is the other half of the reason the
+# floor moved off 3.9: a supported version nobody can check is not supported.
+python_version = "3.10"
 strict = true
 files = ["caged"]
 

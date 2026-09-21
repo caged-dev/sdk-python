@@ -44,5 +44,5 @@ async def connect(url: str, subprotocol: str) -> WebSocketLike:
     """
     return cast(
         WebSocketLike,
-        await websockets.connect(url, subprotocols=[subprotocol]),  # type: ignore[list-item]
+        await websockets.connect(url, subprotocols=[subprotocol]),
     )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from caged.types import Refusal
 
@@ -25,7 +25,7 @@ class CagedAPIError(CagedError):
     def __init__(
         self,
         status: int,
-        body: Optional[Any] = None,
+        body: Any | None = None,
         text: str = "",
     ) -> None:
         self.status = status
@@ -36,7 +36,7 @@ class CagedAPIError(CagedError):
         self.detail = _detail(body)
         #: Machine-readable refusal reason, when the API classified this
         #: failure. Branch on ``reason.code``, never on the message text.
-        self.reason: Optional[Refusal] = _reason(body)
+        self.reason: Refusal | None = _reason(body)
         super().__init__(_message(status, body, text))
 
 
@@ -89,7 +89,7 @@ class CagedConnectionError(CagedError):
         super().__init__(message)
 
 
-def _reason(body: Any) -> Optional[Refusal]:
+def _reason(body: Any) -> Refusal | None:
     if not isinstance(body, dict):
         return None
     raw = body.get("reason")
@@ -98,7 +98,7 @@ def _reason(body: Any) -> Optional[Refusal]:
     return Refusal.from_api(raw)
 
 
-def _detail(body: Any) -> Optional[str]:
+def _detail(body: Any) -> str | None:
     if not isinstance(body, dict):
         return None
     for key in ("detail", "error"):

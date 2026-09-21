@@ -38,6 +38,7 @@ deterministically rather than at a timeout.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import uuid
@@ -92,10 +93,8 @@ class ExecStream:
             # connection is finished with. Closing here rather than leaving
             # it to the caller keeps a completed stream from holding a
             # socket open for the rest of the process's life.
-            try:
+            with contextlib.suppress(Exception):
                 await self._ws.close()
-            except Exception:  # noqa: BLE001 - already shutting down
-                pass
 
     @property
     def exit_code(self) -> int | None:
@@ -112,10 +111,8 @@ class ExecStream:
         await self._ws.close()
         if self._listen_task:
             self._listen_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._listen_task
-            except asyncio.CancelledError:
-                pass
 
     def __aiter__(self) -> AsyncIterator[str]:
         return self

@@ -22,6 +22,7 @@ The wire protocol is ``api.terminalMessage``: ``{"type": "input" | "output" |
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Callable
 from typing import Any
@@ -67,12 +68,12 @@ class TerminalSession:
             raise
         except Exception as exc:  # noqa: BLE001 - reported to the handlers
             if not _is_connection_closed(exc):
-                for handler in self._error_handlers:
-                    handler(exc)
+                for on_error in self._error_handlers:
+                    on_error(exc)
         finally:
             self._closed = True
-            for handler in self._close_handlers:
-                handler()
+            for on_close in self._close_handlers:
+                on_close()
 
     def _emit(self, data: str) -> None:
         for handler in self._output_handlers:
@@ -114,7 +115,5 @@ class TerminalSession:
             await self._ws.close()
             if self._listen_task:
                 self._listen_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await self._listen_task
-                except asyncio.CancelledError:
-                    pass
