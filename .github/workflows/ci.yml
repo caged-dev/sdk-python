@@ -8,11 +8,12 @@ on:
 
 jobs:
   test:
-    name: Test
+    name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12']
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
 
     steps:
       - uses: actions/checkout@v4
@@ -21,16 +22,51 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install
         run: |
-          pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          pip install pytest pytest-asyncio ruff mypy
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
 
       - name: Lint
-        run: ruff check caged/
+        run: ruff check caged/ tests/ scripts/
 
+      # Strict, and without --ignore-missing-imports: that flag hid the fact
+      # that caged/terminal.py annotated against a websockets class which
+      # does not exist in the version this package depends on.
       - name: Type check
-        run: mypy caged/ --ignore-missing-imports
+        run: mypy
 
+      # No `|| true`. This step used to carry it, against a tests/ directory
+      # that did not exist, which is how 14 broken client methods stayed
+      # invisible behind a green CI run.
       - name: Test
-        run: pytest tests/ -v || true
+        run: pytest -v
+
+  artifact:
+    name: Inspect the built wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      # 0.2.0 was published as a repackage of 0.1.0 and nobody noticed,
+      # because every check ran against the working tree. This one runs
+      # against what `pip install` hands a user.
+      - name: Inspect the artifact
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/pip install --quiet dist/*.whl
+          /tmp/verify/bin/python scripts/verify_wheel.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

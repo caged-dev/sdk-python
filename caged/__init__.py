@@ -1,68 +1,133 @@
 """Caged SDK — Official Python client for the Caged AI Agent Sandbox Platform."""
 
+from caged._version import __version__
 from caged.client import Caged
-from caged.errors import CagedError, CagedAPIError, CagedTimeoutError
-from caged.mcp import MCPClient, MCPError, MCPTool, MCPResource, MCPPrompt
+from caged.errors import (
+    CagedAPIError,
+    CagedAuthError,
+    CagedConnectionError,
+    CagedError,
+    CagedNotFoundError,
+    CagedPlanLimitError,
+    CagedRateLimitError,
+    CagedServerError,
+    CagedTimeoutError,
+    CagedValidationError,
+)
+from caged.mcp import MCPClient, MCPError, MCPPrompt, MCPResource, MCPTool
 from caged.stream import ExecStream
 from caged.terminal import TerminalSession
 from caged.types import (
+    CLEAR_CREDENTIAL,
+    EVENT_TYPES,
+    Account,
+    AccountSession,
     AgentSession,
+    AgentSessionPage,
     Alert,
+    AlertPage,
     AlertRule,
     APIKey,
+    CreatedAPIKey,
     EventPayload,
     ExecResult,
     FileEntry,
+    GitDiff,
+    GitFileStatus,
     IngestResponse,
     LogEntry,
     Notification,
     NotificationConfig,
+    NotificationConfigUpdate,
+    NotificationPage,
+    Pagination,
     Port,
+    Refusal,
     ReplayEvent,
+    ReplayPage,
     ReplaySummary,
+    RuleConfig,
     Sandbox,
+    SandboxConfigSummary,
     SandboxCreateParams,
-    Session,
     Snapshot,
     SnapshotCreateParams,
+    SnapshotDownload,
+    SocketTicket,
     Subscription,
-    TrustScore,
+    TrustScoreSummary,
+    Usage,
 )
 
-__version__ = "0.2.0"
+#: Deprecated aliases kept so existing imports keep resolving. Both models
+#: were renamed in 0.3.0 to match the payloads the API actually returns —
+#: neither old shape could ever be built from a real response. Removed no
+#: earlier than 0.5.0.
+TrustScore = TrustScoreSummary
+Session = AccountSession
+
 __all__ = [
+    "__version__",
     "Caged",
-    "CagedError",
+    # Errors
     "CagedAPIError",
+    "CagedAuthError",
+    "CagedConnectionError",
+    "CagedError",
+    "CagedNotFoundError",
+    "CagedPlanLimitError",
+    "CagedRateLimitError",
+    "CagedServerError",
     "CagedTimeoutError",
+    "CagedValidationError",
     # WebSocket
-    "TerminalSession",
+    "ExecStream",
     "MCPClient",
     "MCPError",
-    "MCPTool",
-    "MCPResource",
     "MCPPrompt",
-    "ExecStream",
+    "MCPResource",
+    "MCPTool",
+    "TerminalSession",
     # Types
+    "CLEAR_CREDENTIAL",
+    "EVENT_TYPES",
+    "Account",
+    "AccountSession",
     "AgentSession",
+    "AgentSessionPage",
     "Alert",
+    "AlertPage",
     "AlertRule",
     "APIKey",
+    "CreatedAPIKey",
     "EventPayload",
     "ExecResult",
     "FileEntry",
+    "GitDiff",
+    "GitFileStatus",
     "IngestResponse",
     "LogEntry",
     "Notification",
     "NotificationConfig",
+    "NotificationConfigUpdate",
+    "NotificationPage",
+    "Pagination",
     "Port",
+    "Refusal",
     "ReplayEvent",
+    "ReplayPage",
     "ReplaySummary",
+    "RuleConfig",
     "Sandbox",
+    "SandboxConfigSummary",
     "SandboxCreateParams",
     "Session",
     "Snapshot",
     "SnapshotCreateParams",
+    "SnapshotDownload",
+    "SocketTicket",
     "Subscription",
     "TrustScore",
+    "TrustScoreSummary",
+    "Usage",
 ]

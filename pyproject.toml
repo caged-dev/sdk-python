@@ -1,6 +1,10 @@
 [project]
 name = "caged-sdk"
-version = "0.2.0"
+# Single source of truth: caged/_version.py, which caged.client also reads for
+# the User-Agent header and caged.mcp for its clientInfo. It used to be
+# written here as well, which is how a published build can announce a version
+# it is not.
+dynamic = ["version"]
 description = "Official Python SDK for the Caged AI Agent Sandbox Platform"
 readme = "README.md"
 license = "MIT"
@@ -16,9 +20,21 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 dependencies = ["httpx>=0.25.0", "websockets>=12.0"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+    "ruff>=0.5",
+    # tests/test_packaging.py reads this file. tomllib is stdlib from 3.11 and
+    # the matrix still covers 3.9.
+    "tomli>=2.0; python_version < '3.11'",
+]
 
 [project.urls]
 Homepage = "https://caged.dev"
@@ -30,5 +46,46 @@ Issues = "https://github.com/caged-dev/sdk-python/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "caged/_version.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["caged"]
+
+[tool.hatch.build.targets.sdist]
+include = ["caged", "tests", "README.md", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ imports tests.conftest for its fixtures, so the package root has to
+# be on sys.path.
+pythonpath = ["."]
+asyncio_mode = "auto"
+# A deprecation this package raises on purpose is part of its contract, so a
+# test that triggers one has to say so.
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N"]
+
+[tool.ruff.lint.per-file-ignores]
+# The first-call regression table reads better as one case per line than
+# wrapped across four.
+"tests/test_client.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["caged"]
+
+[[tool.mypy.overrides]]
+# websockets renamed its client connection class between 12 and 14, so its
+# own annotations are not stable across the range this package supports.
+# caged/_ws.py pins the shape this SDK depends on instead.
+module = "websockets.*"
+ignore_missing_imports = true
+follow_imports = "skip"

@@ -2,41 +2,60 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
+import builtins
+import warnings
+from collections.abc import Mapping
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from typing import Any
+from urllib.parse import quote, urlencode
 
 import httpx
-import websockets
-import websockets.client
 
-from caged.errors import CagedAPIError, CagedTimeoutError
+from caged import _ws
+from caged._version import __version__
+from caged.errors import (
+    CagedConnectionError,
+    CagedError,
+    CagedNotFoundError,
+    CagedTimeoutError,
+    error_for_status,
+)
 from caged.mcp import MCPClient
 from caged.stream import ExecStream
 from caged.terminal import TerminalSession
 from caged.types import (
+    Account,
+    AccountSession,
     AgentSession,
+    AgentSessionPage,
     Alert,
+    AlertPage,
     AlertRule,
     APIKey,
+    CreatedAPIKey,
     EventPayload,
     ExecResult,
     FileEntry,
+    GitDiff,
     IngestResponse,
     LogEntry,
     Notification,
     NotificationConfig,
+    NotificationConfigUpdate,
+    NotificationPage,
     Port,
-    ReplayEvent,
+    ReplayPage,
     ReplaySummary,
+    RuleConfig,
     Sandbox,
     SandboxCreateParams,
-    Session,
     Snapshot,
-    SnapshotCreateParams,
+    SnapshotDownload,
+    SocketTicket,
     Subscription,
-    TrustScore,
+    TrustScoreSummary,
+    Usage,
 )
 
 DEFAULT_BASE_URL = "https://api.caged.dev"
@@ -48,18 +67,19 @@ DEFAULT_EXEC_TIMEOUT = 300.0
 # Sandbox creation can include a repo clone and agent installs.
 DEFAULT_CREATE_TIMEOUT = 360.0
 
+_UNSET = object()
+
 
 class Caged:
-    """
-    Caged SDK client.
+    """Caged SDK client.
 
     Usage::
 
         from caged import Caged
 
-        caged = Caged(api_key="caged_sk_...")
-        sandbox = caged.sandboxes.create(template="node-20")
-        print(sandbox.id, sandbox.status)
+        with Caged(api_key=os.environ["CAGED_API_KEY"]) as caged:
+            sandbox = caged.sandboxes.create(template="node-20")
+            print(sandbox.id, sandbox.status)
     """
 
     def __init__(
@@ -67,19 +87,24 @@ class Caged:
         api_key: str,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not api_key:
-            raise ValueError("api_key is required")
+            raise CagedError("api_key is required")
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
         self._client = httpx.Client(
             base_url=f"{self._base_url}/v1",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "caged-python/0.2.0",
+                "Accept": "application/json",
+                "User-Agent": f"caged-python/{__version__}",
             },
+            # Every external call is bounded; per-call overrides are passed
+            # explicitly by the methods that need a longer budget.
             timeout=timeout,
+            transport=transport,
         )
 
         self.sandboxes = _SandboxesAPI(self)
@@ -96,69 +121,174 @@ class Caged:
         """Close the underlying HTTP client."""
         self._client.close()
 
-    def __enter__(self) -> "Caged":
+    def __enter__(self) -> Caged:
         return self
 
     def __exit__(self, *_: Any) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    # --- transport ---
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json: Any = _UNSET,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        effective_timeout = self._timeout if timeout is None else timeout
+        kwargs: dict[str, Any] = {"timeout": effective_timeout}
+        if params is not None:
+            kwargs["params"] = {k: v for k, v in params.items() if v is not None}
+        if json is not _UNSET:
+            kwargs["json"] = json
+
         try:
             response = self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
-            raise CagedTimeoutError(self._client.timeout.read or DEFAULT_TIMEOUT) from exc
+            raise CagedTimeoutError(effective_timeout) from exc
+        except httpx.HTTPError as exc:
+            raise CagedConnectionError(
+                f"{method} {path} failed before a response arrived: {exc}"
+            ) from exc
 
         if response.status_code >= 400:
-            body = response.json() if response.content else None
-            raise CagedAPIError(response.status_code, body)
+            raise error_for_status(
+                response.status_code, _try_json(response), response.text
+            )
+        return response
 
-        if response.status_code == 204:
-            return None
+    def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Perform a request whose response body is JSON."""
+        response = self._send(method, path, **kwargs)
+        if not response.content:
+            raise CagedError(
+                f"{method} {path} returned {response.status_code} with an empty body "
+                "where JSON was expected"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            content_type = response.headers.get("content-type", "none")
+            raise CagedError(
+                f"{method} {path} returned {response.status_code} with a body that is "
+                f"not JSON (content-type: {content_type})"
+            ) from exc
+
+    def _request_text(self, method: str, path: str, **kwargs: Any) -> str:
+        """Perform a request whose response body is plain text."""
+        return self._send(method, path, **kwargs).text
+
+    def _request_none(self, method: str, path: str, **kwargs: Any) -> None:
+        """Perform a request whose response body is discarded."""
+        self._send(method, path, **kwargs)
+
+    # --- websockets ---
+
+    def socket_ticket(self) -> SocketTicket:
+        """Mint a short-lived, single-use credential for one WebSocket.
+
+        The browser API cannot set headers on a WebSocket handshake, so the
+        credential has to ride in the URL — and a URL reaches every proxy
+        that logs a request line. The API therefore issues tickets that
+        expire in a minute and are refused anywhere but a handshake.
+        """
+        return SocketTicket.from_api(self._request_json("POST", "/auth/socket-ticket"))
+
+    async def _socket_token(self) -> str:
+        """Return the credential to put in a WebSocket handshake URL.
+
+        Prefers a ticket. Falls back to the API key when the API does not
+        serve the ticket endpoint — a deployment older than the endpoint
+        would otherwise lose every socket — which is what this SDK always
+        did, and what the server logs a warning about.
+        """
+        try:
+            ticket = await asyncio.to_thread(self.socket_ticket)
+        except CagedNotFoundError:
+            return self._api_key
+        return ticket.ticket or self._api_key
+
+    async def _ws_connect(
+        self, path: str, subprotocol: str, params: Mapping[str, Any] | None = None
+    ) -> _ws.WebSocketLike:
+        token = await self._socket_token()
+        query = dict(params or {})
+        query["token"] = token
+        ws_base = self._base_url.replace("https://", "wss://").replace(
+            "http://", "ws://"
+        )
+        url = f"{ws_base}/v1{path}?{urlencode(query)}"
+        return await _ws.connect(url, subprotocol)
+
+
+def _try_json(response: httpx.Response) -> Any:
+    if not response.content:
+        return None
+    if "json" not in response.headers.get("content-type", ""):
+        return None
+    try:
         return response.json()
-
-    def _ws_url(self, path: str) -> str:
-        """Build a WebSocket URL with auth token."""
-        ws_base = self._base_url.replace("http://", "ws://").replace("https://", "wss://")
-        url = f"{ws_base}/v1{path}"
-        separator = "&" if "?" in url else "?"
-        return f"{url}{separator}token={self._api_key}"
-
-
-# --- Sandboxes ---
+    except ValueError:
+        return None
 
 
 class _SandboxesAPI:
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def create(
-        self,
-        template: str = "minimal",
-        cpus: int = 2,
-        memory_mb: int = 512,
-        **kwargs: Any,
-    ) -> Sandbox:
-        """Create a new sandbox."""
-        params = SandboxCreateParams(template=template, cpus=cpus, memory_mb=memory_mb, **kwargs)
-        body = {k: v for k, v in asdict(params).items() if v is not None and v != [] and v != {}}
-        data = self._client._request("POST", "/sandboxes", json=body, timeout=DEFAULT_CREATE_TIMEOUT)
-        return Sandbox(**{k: v for k, v in data.items() if k in Sandbox.__dataclass_fields__})
+    def create(self, template: str = "minimal", **kwargs: Any) -> Sandbox:
+        """Create a new sandbox.
 
-    def exec(self, id: str, command: str, timeout: float = DEFAULT_EXEC_TIMEOUT) -> ExecResult:
-        """Run a shell command in a sandbox and return its output and exit code."""
-        data = self._client._request(
-            "POST", f"/sandboxes/{id}/exec", json={"command": command}, timeout=timeout
+        ``template`` is required by the API. Any other field of
+        :class:`~caged.types.SandboxCreateParams` may be passed as a keyword;
+        unset fields are omitted from the request body so the server's own
+        defaults apply.
+        """
+        if not template:
+            raise CagedError("template is required to create a sandbox")
+        try:
+            params = SandboxCreateParams(template=template, **kwargs)
+        except TypeError as exc:
+            raise CagedError(f"unknown sandbox create parameter: {exc}") from exc
+        body = {
+            k: v
+            for k, v in asdict(params).items()
+            if v is not None and v != [] and v != {}
+        }
+        data = self._client._request_json(
+            "POST", "/sandboxes", json=body, timeout=DEFAULT_CREATE_TIMEOUT
         )
-        return ExecResult(
-            output=data.get("output", ""),
-            exit_code=data.get("exit_code", 0),
-            error=data.get("error") or None,
+        return Sandbox.from_api(data)
+
+    def exec(
+        self, id: str, command: str, timeout: float = DEFAULT_EXEC_TIMEOUT
+    ) -> ExecResult:
+        """Run a shell command in a sandbox and return its output and exit code.
+
+        Supports pipes and redirects. A non-zero exit code does not raise;
+        check ``result.ok`` or ``result.exit_code``.
+
+        Usage::
+
+            result = caged.sandboxes.exec(sandbox.id, 'claude -p "explain this repo"')
+            print(result.output)
+        """
+        data = self._client._request_json(
+            "POST",
+            f"/sandboxes/{_seg(id)}/exec",
+            json={"command": command},
+            timeout=timeout,
         )
+        return ExecResult.from_api(data)
 
     async def exec_stream(self, id: str, command: str) -> ExecStream:
         """Run a command with real-time streaming output.
 
-        Returns an async iterable that yields output chunks as they arrive.
+        Returns an async iterable that yields output chunks as they arrive
+        and carries the command's exit code once it has finished.
 
         Usage::
 
@@ -167,12 +297,11 @@ class _SandboxesAPI:
                 print(chunk, end="")
             print(f"Exit code: {stream.exit_code}")
         """
-        url = self._client._ws_url(f"/sandboxes/{id}/terminal")
-        ws = await websockets.connect(url, subprotocols=["mcp"])
-        # Send command once connected.
-        await ws.send(json.dumps({"type": "input", "data": command + "\n"}))
+        ws = await self._client._ws_connect(
+            f"/sandboxes/{_seg(id)}/terminal", "terminal"
+        )
         stream = ExecStream(ws)
-        await stream._start_listening()
+        await stream._start(command)
         return stream
 
     async def terminal(
@@ -187,8 +316,11 @@ class _SandboxesAPI:
             await terminal.send("ls -la\\n")
             await terminal.close()
         """
-        url = self._client._ws_url(f"/sandboxes/{id}/terminal?rows={rows}&cols={cols}")
-        ws = await websockets.connect(url, subprotocols=["mcp"])
+        ws = await self._client._ws_connect(
+            f"/sandboxes/{_seg(id)}/terminal",
+            "terminal",
+            {"rows": rows, "cols": cols},
+        )
         session = TerminalSession(ws)
         await session._start_listening()
         return session
@@ -196,7 +328,8 @@ class _SandboxesAPI:
     async def mcp(self, id: str) -> MCPClient:
         """Connect to the sandbox via MCP (Model Context Protocol).
 
-        Provides tool calling for filesystem, terminal, git, and network operations.
+        Provides tool calling for filesystem, terminal, git and network
+        operations. The sandbox must be running.
 
         Usage::
 
@@ -205,259 +338,430 @@ class _SandboxesAPI:
             result = await mcp.call_tool("filesystem_read", {"path": "package.json"})
             await mcp.close()
         """
-        url = self._client._ws_url(f"/sandboxes/{id}/mcp")
-        ws = await websockets.connect(url, subprotocols=["mcp"])
+        ws = await self._client._ws_connect(f"/sandboxes/{_seg(id)}/mcp", "mcp")
         client = MCPClient(ws)
         await client._start_listening()
         await client.initialize()
         return client
 
-    def list(self) -> List[Sandbox]:
+    def list(self) -> builtins.list[Sandbox]:
         """List all sandboxes for the authenticated account."""
-        data = self._client._request("GET", "/sandboxes")
-        return [Sandbox(**{k: v for k, v in s.items() if k in Sandbox.__dataclass_fields__}) for s in data]
+        return Sandbox.list_from_api(self._client._request_json("GET", "/sandboxes"))
 
     def get(self, id: str) -> Sandbox:
         """Get a sandbox by ID."""
-        data = self._client._request("GET", f"/sandboxes/{id}")
-        return Sandbox(**{k: v for k, v in data.items() if k in Sandbox.__dataclass_fields__})
+        return Sandbox.from_api(
+            self._client._request_json("GET", f"/sandboxes/{_seg(id)}")
+        )
 
     def destroy(self, id: str) -> None:
-        """Destroy a sandbox."""
-        self._client._request("DELETE", f"/sandboxes/{id}")
+        """Destroy (permanently delete) a sandbox."""
+        self._client._request_none("DELETE", f"/sandboxes/{_seg(id)}")
 
     def pause(self, id: str) -> None:
         """Pause a running sandbox."""
-        self._client._request("POST", f"/sandboxes/{id}/pause")
+        self._client._request_none("POST", f"/sandboxes/{_seg(id)}/pause")
 
     def resume(self, id: str) -> None:
         """Resume a paused sandbox."""
-        self._client._request("POST", f"/sandboxes/{id}/resume")
+        self._client._request_none("POST", f"/sandboxes/{_seg(id)}/resume")
 
-    def logs(self, id: str, tail: Optional[int] = None) -> List[LogEntry]:
-        """Get sandbox logs (stdout/stderr)."""
-        query = f"?tail={tail}" if tail else ""
-        data = self._client._request("GET", f"/sandboxes/{id}/logs{query}")
-        return [LogEntry(**entry) for entry in data]
-
-    def ports(self, id: str) -> List[Port]:
+    def ports(self, id: str) -> builtins.list[Port]:
         """List open ports for a sandbox."""
-        data = self._client._request("GET", f"/sandboxes/{id}/ports")
-        return [Port(**p) for p in data]
+        return Port.list_from_api(
+            self._client._request_json("GET", f"/sandboxes/{_seg(id)}/ports")
+        )
 
-    def trust_scores(self, sandbox_id: str) -> List[TrustScore]:
-        """Get trust scores for a sandbox."""
-        data = self._client._request("GET", f"/trust/sandboxes/{sandbox_id}")
-        return [TrustScore(**s) for s in data]
+    def logs(self, id: str, tail: int | None = None) -> builtins.list[LogEntry]:
+        """Fetch recent lifecycle log entries for a sandbox.
 
+        ``tail`` is a line count; the API clamps it to its own ceiling.
+        """
+        return LogEntry.list_from_api(
+            self._client._request_json(
+                "GET", f"/sandboxes/{_seg(id)}/logs", params={"tail": tail}
+            )
+        )
 
-# --- Files ---
+    def trust_scores(self, sandbox_id: str) -> builtins.list[TrustScoreSummary]:
+        """Trust scores for every agent session run in a sandbox.
+
+        ``score`` is an integer out of 100.
+        """
+        return TrustScoreSummary.list_from_api(
+            self._client._request_json("GET", f"/trust/sandboxes/{_seg(sandbox_id)}")
+        )
 
 
 class _FilesAPI:
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def list(self, sandbox_id: str, path: str = "/") -> List[FileEntry]:
-        """List files in a directory."""
-        data = self._client._request("GET", f"/sandboxes/{sandbox_id}/files", params={"path": path})
-        return [FileEntry(**f) for f in data]
+    def list(
+        self, sandbox_id: str, path: str = "/workspace"
+    ) -> builtins.list[FileEntry]:
+        """List files in a directory (default: ``/workspace``)."""
+        return FileEntry.list_from_api(
+            self._client._request_json(
+                "GET", f"/sandboxes/{_seg(sandbox_id)}/files", params={"path": path}
+            )
+        )
 
     def read(self, sandbox_id: str, path: str) -> str:
-        """Read file content."""
-        return self._client._request("GET", f"/sandboxes/{sandbox_id}/files/content", params={"path": path})
+        """Read file content.
+
+        The endpoint answers ``text/plain``, so the file's bytes come back
+        as a string rather than being parsed as JSON. Files over 1MB are
+        rejected by the API.
+        """
+        return self._client._request_text(
+            "GET",
+            f"/sandboxes/{_seg(sandbox_id)}/files/content",
+            params={"path": path},
+        )
 
     def write(self, sandbox_id: str, path: str, content: str) -> None:
-        """Write content to a file."""
-        self._client._request("PUT", f"/sandboxes/{sandbox_id}/files/content", json={"path": path, "content": content})
+        """Write content to a file.
 
-    def git_diff(self, sandbox_id: str) -> str:
-        """Get git diff for the sandbox workspace."""
-        return self._client._request("GET", f"/sandboxes/{sandbox_id}/git/diff")
+        The target path travels in the query string — that is where the API
+        reads it from — and only the content is sent in the body.
+        """
+        self._client._request_none(
+            "PUT",
+            f"/sandboxes/{_seg(sandbox_id)}/files/content",
+            params={"path": path},
+            json={"content": content},
+        )
 
-
-# --- Snapshots ---
+    def git_diff(self, sandbox_id: str, path: str | None = None) -> GitDiff:
+        """Git status and diff for a working tree (default: ``/workspace``)."""
+        return GitDiff.from_api(
+            self._client._request_json(
+                "GET", f"/sandboxes/{_seg(sandbox_id)}/git/diff", params={"path": path}
+            )
+        )
 
 
 class _SnapshotsAPI:
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def list(self, sandbox_id: str) -> List[Snapshot]:
+    def list(self, sandbox_id: str) -> builtins.list[Snapshot]:
         """List snapshots for a sandbox."""
-        data = self._client._request("GET", f"/sandboxes/{sandbox_id}/snapshots")
-        return [Snapshot(**{k: v for k, v in s.items() if k in Snapshot.__dataclass_fields__}) for s in data]
+        return Snapshot.list_from_api(
+            self._client._request_json(
+                "GET", f"/sandboxes/{_seg(sandbox_id)}/snapshots"
+            )
+        )
 
-    def create(self, sandbox_id: str, name: Optional[str] = None, description: Optional[str] = None) -> Snapshot:
+    def create(
+        self,
+        sandbox_id: str,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Snapshot:
         """Create a snapshot of the sandbox workspace."""
-        body: Dict[str, Any] = {}
+        body: dict[str, Any] = {}
         if name:
             body["name"] = name
         if description:
             body["description"] = description
-        data = self._client._request("POST", f"/sandboxes/{sandbox_id}/snapshots", json=body)
-        return Snapshot(**{k: v for k, v in data.items() if k in Snapshot.__dataclass_fields__})
+        return Snapshot.from_api(
+            self._client._request_json(
+                "POST", f"/sandboxes/{_seg(sandbox_id)}/snapshots", json=body
+            )
+        )
 
     def get(self, snapshot_id: str) -> Snapshot:
         """Get snapshot details."""
-        data = self._client._request("GET", f"/snapshots/{snapshot_id}")
-        return Snapshot(**{k: v for k, v in data.items() if k in Snapshot.__dataclass_fields__})
+        return Snapshot.from_api(
+            self._client._request_json("GET", f"/snapshots/{_seg(snapshot_id)}")
+        )
 
     def delete(self, snapshot_id: str) -> None:
         """Delete a snapshot."""
-        self._client._request("DELETE", f"/snapshots/{snapshot_id}")
+        self._client._request_none("DELETE", f"/snapshots/{_seg(snapshot_id)}")
+
+    def download(self, snapshot_id: str) -> SnapshotDownload:
+        """Get a download URL for a snapshot, with its expiry."""
+        return SnapshotDownload.from_api(
+            self._client._request_json(
+                "GET", f"/snapshots/{_seg(snapshot_id)}/download"
+            )
+        )
 
     def download_url(self, snapshot_id: str) -> str:
-        """Get a presigned download URL for a snapshot."""
-        data = self._client._request("GET", f"/snapshots/{snapshot_id}/download")
-        return data["url"]
+        """Get just the download URL for a snapshot.
 
-    def restore(self, snapshot_id: str) -> None:
-        """Restore a snapshot into its sandbox."""
-        self._client._request("POST", f"/snapshots/{snapshot_id}/restore")
+        .. deprecated:: 0.3.0
+           Use :meth:`download`, which also returns the expiry. This
+           wrapper stays until at least 0.5.0.
+        """
+        _deprecated(
+            "Caged.snapshots.download_url() is deprecated; use "
+            "Caged.snapshots.download(), which also returns the expiry"
+        )
+        return self.download(snapshot_id).url
 
+    def restore(self, snapshot_id: str, target_sandbox_id: str) -> None:
+        """Restore a snapshot into a sandbox.
 
-# --- Account ---
+        ``target_sandbox_id`` is required: a snapshot is restored into a
+        sandbox the caller names, not into the one it was taken from.
+        """
+        if not target_sandbox_id:
+            raise CagedError("target_sandbox_id is required to restore a snapshot")
+        self._client._request_none(
+            "POST",
+            f"/snapshots/{_seg(snapshot_id)}/restore",
+            json={"target_sandbox_id": target_sandbox_id},
+        )
 
 
 class _AccountAPI:
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def list_keys(self) -> List[APIKey]:
-        """List API keys."""
-        data = self._client._request("GET", "/account/keys")
-        return [APIKey(**k) for k in data]
+    def get(self) -> Account:
+        """Get the authenticated account."""
+        return Account.from_api(self._client._request_json("GET", "/account"))
 
-    def create_key(self, name: str) -> Dict[str, Any]:
-        """Create a new API key. Returns key data including the secret."""
-        return self._client._request("POST", "/account/keys", json={"name": name})
+    def list_keys(self) -> builtins.list[APIKey]:
+        """List API keys."""
+        return APIKey.list_from_api(self._client._request_json("GET", "/account/keys"))
+
+    def create_key(self, name: str, scope: str = "full") -> CreatedAPIKey:
+        """Create a new API key.
+
+        The secret is in ``result.key`` and is never returned again; the
+        metadata is in ``result.info``. ``scope`` is "full" or "read_only".
+        """
+        return CreatedAPIKey.from_api(
+            self._client._request_json(
+                "POST", "/account/keys", json={"name": name, "scope": scope}
+            )
+        )
 
     def revoke_key(self, id: str) -> None:
         """Revoke an API key."""
-        self._client._request("DELETE", f"/account/keys/{id}")
+        self._client._request_none("DELETE", f"/account/keys/{_seg(id)}")
 
-    def list_sessions(self) -> List[Session]:
-        """List active sessions."""
-        data = self._client._request("GET", "/account/sessions")
-        return [Session(**s) for s in data]
+    def list_sessions(self) -> builtins.list[AccountSession]:
+        """List active dashboard sessions."""
+        return AccountSession.list_from_api(
+            self._client._request_json("GET", "/account/sessions")
+        )
 
     def revoke_session(self, id: str) -> None:
-        """Revoke a session."""
-        self._client._request("DELETE", f"/account/sessions/{id}")
-
-
-# --- Sessions (Agent session history & replay) ---
+        """Revoke a dashboard session."""
+        self._client._request_none("DELETE", f"/account/sessions/{_seg(id)}")
 
 
 class _SessionsAPI:
+    """Agent session history and replay."""
+
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def list_by_sandbox(self, sandbox_id: str) -> List[AgentSession]:
-        """List agent sessions for a sandbox."""
-        data = self._client._request("GET", f"/sandboxes/{sandbox_id}/sessions")
-        return [AgentSession(**{k: v for k, v in s.items() if k in AgentSession.__dataclass_fields__}) for s in data]
+    def list_by_sandbox(self, sandbox_id: str) -> builtins.list[AgentSession]:
+        """List agent sessions for one sandbox."""
+        return AgentSession.list_from_api(
+            self._client._request_json("GET", f"/sandboxes/{_seg(sandbox_id)}/sessions")
+        )
+
+    def list(self, page: int = 1, per_page: int | None = None) -> AgentSessionPage:
+        """List every agent session in the account, newest first.
+
+        Paginated: the sessions are in ``result.data`` and the position in
+        ``result.pagination``.
+        """
+        return AgentSessionPage.from_api(
+            self._client._request_json(
+                "GET", "/sessions", params={"page": page, "per_page": per_page}
+            )
+        )
 
     def get(self, session_id: str) -> AgentSession:
         """Get an agent session by ID."""
-        data = self._client._request("GET", f"/sessions/{session_id}")
-        return AgentSession(**{k: v for k, v in data.items() if k in AgentSession.__dataclass_fields__})
+        return AgentSession.from_api(
+            self._client._request_json("GET", f"/sessions/{_seg(session_id)}")
+        )
 
-    def replay(self, session_id: str) -> List[ReplayEvent]:
-        """Get full replay timeline for a session."""
-        data = self._client._request("GET", f"/sessions/{session_id}/replay")
-        return [ReplayEvent(**{k: v for k, v in e.items() if k in ReplayEvent.__dataclass_fields__}) for e in data]
+    def replay(
+        self,
+        session_id: str,
+        after_seq: int | None = None,
+        limit: int | None = None,
+        type: str | None = None,
+    ) -> ReplayPage:
+        """Fetch a page of a session's replay timeline.
+
+        The endpoint answers an object, not a bare array: the events are in
+        ``result.events``, and while ``result.has_more`` is true the next
+        page starts at ``after_seq=result.next_seq``. ``limit`` is clamped
+        to 1000 by the API.
+        """
+        return ReplayPage.from_api(
+            self._client._request_json(
+                "GET",
+                f"/sessions/{_seg(session_id)}/replay",
+                params={"after_seq": after_seq, "limit": limit, "type": type},
+            )
+        )
 
     def replay_summary(self, session_id: str) -> ReplaySummary:
-        """Get a summary of a session replay (cost, tokens, duration)."""
-        data = self._client._request("GET", f"/sessions/{session_id}/replay/summary")
-        return ReplaySummary(**{k: v for k, v in data.items() if k in ReplaySummary.__dataclass_fields__})
+        """Event counts and wall-clock duration for a session's replay.
 
-
-# --- Events (Observability ingestion) ---
+        Tokens and cost are on :class:`~caged.types.AgentSession`, not here.
+        """
+        return ReplaySummary.from_api(
+            self._client._request_json(
+                "GET", f"/sessions/{_seg(session_id)}/replay/summary"
+            )
+        )
 
 
 class _EventsAPI:
+    """Observability event ingestion."""
+
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def ingest(self, events: List[EventPayload]) -> IngestResponse:
-        """Ingest observability events. Max 1000 events per batch."""
-        body = {"events": [asdict(e) for e in events]}
-        data = self._client._request("POST", "/events/ingest", json=body)
-        return IngestResponse(**data)
+    def ingest(self, events: builtins.list[EventPayload]) -> IngestResponse:
+        """Ingest observability events. Max 1000 events per batch.
 
-
-# --- Alerts ---
+        The account is taken from the API key; an ``account_id`` on an event
+        is ignored by the server.
+        """
+        if len(events) > 1000:
+            raise CagedError(
+                f"batch too large: {len(events)} events, the API accepts at most 1000"
+            )
+        body = {"events": [e.to_api() for e in events]}
+        return IngestResponse.from_api(
+            self._client._request_json("POST", "/events/ingest", json=body)
+        )
 
 
 class _AlertsAPI:
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def list(self) -> List[Alert]:
-        """List all alerts for the account."""
-        data = self._client._request("GET", "/alerts")
-        return [Alert(**{k: v for k, v in a.items() if k in Alert.__dataclass_fields__}) for a in data]
+    def list(self, limit: int | None = None, offset: int | None = None) -> AlertPage:
+        """List alerts for the account, newest first.
+
+        The alerts are in ``result.alerts`` and the account's total in
+        ``result.total``. ``limit`` must be 1-100; the API serves 50 for
+        anything outside that.
+        """
+        return AlertPage.from_api(
+            self._client._request_json(
+                "GET", "/alerts", params={"limit": limit, "offset": offset}
+            )
+        )
 
     def get(self, id: str) -> Alert:
         """Get an alert by ID."""
-        data = self._client._request("GET", f"/alerts/{id}")
-        return Alert(**{k: v for k, v in data.items() if k in Alert.__dataclass_fields__})
+        return Alert.from_api(self._client._request_json("GET", f"/alerts/{_seg(id)}"))
 
     def resolve(self, id: str) -> None:
         """Resolve an alert."""
-        self._client._request("POST", f"/alerts/{id}/resolve")
+        self._client._request_none("POST", f"/alerts/{_seg(id)}/resolve")
 
-    def list_rules(self) -> List[AlertRule]:
-        """List alert rules."""
-        data = self._client._request("GET", "/alerts/rules")
-        return [AlertRule(**{k: v for k, v in r.items() if k in AlertRule.__dataclass_fields__}) for r in data]
+    def list_rules(self) -> builtins.list[AlertRule]:
+        """List the account's alert rules."""
+        return AlertRule.list_from_api(
+            self._client._request_json("GET", "/alerts/rules")
+        )
 
-    def update_rule(self, id: str, **kwargs: Any) -> AlertRule:
-        """Update an alert rule."""
-        data = self._client._request("PUT", f"/alerts/rules/{id}", json=kwargs)
-        return AlertRule(**{k: v for k, v in data.items() if k in AlertRule.__dataclass_fields__})
+    def update_rule(
+        self,
+        id: str,
+        enabled: bool | None = None,
+        config: RuleConfig | None = None,
+    ) -> AlertRule:
+        """Enable, disable or retune an alert rule.
 
-
-# --- Notifications ---
+        Only what is passed is changed. The endpoint accepts exactly these
+        two fields; a rule's type is fixed.
+        """
+        body: dict[str, Any] = {}
+        if enabled is not None:
+            body["enabled"] = enabled
+        if config is not None:
+            body["config"] = config.to_api()
+        if not body:
+            raise CagedError("update_rule needs enabled or config")
+        return AlertRule.from_api(
+            self._client._request_json("PUT", f"/alerts/rules/{_seg(id)}", json=body)
+        )
 
 
 class _NotificationsAPI:
     def __init__(self, client: Caged) -> None:
         self._client = client
 
-    def list(self) -> List[Notification]:
-        """List notifications."""
-        data = self._client._request("GET", "/notifications")
-        return [Notification(**{k: v for k, v in n.items() if k in Notification.__dataclass_fields__}) for n in data]
+    def list(
+        self, unread_only: bool = False, limit: int | None = None
+    ) -> NotificationPage:
+        """List notifications.
+
+        The notifications are in ``result.notifications`` and the unread
+        badge count in ``result.unread_count``. ``limit`` must be 1-100.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if unread_only:
+            params["unread"] = "true"
+        return NotificationPage.from_api(
+            self._client._request_json("GET", "/notifications", params=params)
+        )
+
+    def list_unread(self, limit: int | None = None) -> builtins.list[Notification]:
+        """The unread notifications only, as a plain list."""
+        return self.list(unread_only=True, limit=limit).notifications
 
     def unread_count(self) -> int:
-        """Get unread notification count."""
-        data = self._client._request("GET", "/notifications/unread-count")
-        return data["count"]
+        """Count unread notifications.
+
+        The endpoint answers ``{"unread_count": n}``; the key is not
+        ``count``.
+        """
+        data = self._client._request_json("GET", "/notifications/unread-count")
+        if not isinstance(data, Mapping) or "unread_count" not in data:
+            raise CagedError(
+                "GET /notifications/unread-count did not return an unread_count"
+            )
+        return int(data["unread_count"])
 
     def mark_read(self, id: str) -> None:
-        """Mark a notification as read."""
-        self._client._request("POST", f"/notifications/{id}/read")
+        """Mark one notification as read."""
+        self._client._request_none("POST", f"/notifications/{_seg(id)}/read")
 
     def mark_all_read(self) -> None:
-        """Mark all notifications as read."""
-        self._client._request("POST", "/notifications/read-all")
+        """Mark every notification as read."""
+        self._client._request_none("POST", "/notifications/read-all")
 
     def get_config(self) -> NotificationConfig:
-        """Get notification configuration."""
-        data = self._client._request("GET", "/notifications/config")
-        return NotificationConfig(**{k: v for k, v in data.items() if k in NotificationConfig.__dataclass_fields__})
+        """Get the account's notification channel configuration.
 
-    def update_config(self, **kwargs: Any) -> NotificationConfig:
-        """Update notification configuration."""
-        data = self._client._request("PUT", "/notifications/config", json=kwargs)
-        return NotificationConfig(**{k: v for k, v in data.items() if k in NotificationConfig.__dataclass_fields__})
+        Credentials are never returned; each is reported as a
+        ``*_configured`` boolean with a hint.
+        """
+        return NotificationConfig.from_api(
+            self._client._request_json("GET", "/notifications/config")
+        )
 
+    def update_config(self, update: NotificationConfigUpdate) -> NotificationConfig:
+        """Update the account's notification channel configuration.
 
-# --- Billing ---
+        An omitted webhook URL is left as it is; pass
+        :data:`~caged.types.CLEAR_CREDENTIAL` to remove one.
+        """
+        return NotificationConfig.from_api(
+            self._client._request_json(
+                "PUT", "/notifications/config", json=update.to_api()
+            )
+        )
 
 
 class _BillingAPI:
@@ -465,51 +769,48 @@ class _BillingAPI:
         self._client = client
 
     def get_subscription(self) -> Subscription:
-        """Get current subscription details."""
-        data = self._client._request("GET", "/billing/subscription")
-        return Subscription(**{k: v for k, v in data.items() if k in Subscription.__dataclass_fields__})
+        """Get the account's subscription. ``tier`` is the plan name."""
+        return Subscription.from_api(
+            self._client._request_json("GET", "/billing/subscription")
+        )
+
+    def get_usage(self) -> Usage:
+        """Get metered compute time for the current billing period."""
+        return Usage.from_api(self._client._request_json("GET", "/billing/usage"))
 
     def create_checkout(self, plan: str) -> str:
-        """Create a Stripe checkout session. Returns checkout URL."""
-        data = self._client._request("POST", "/billing/checkout", json={"plan": plan})
-        return data["url"]
+        """Create a Stripe Checkout session and return its URL.
+
+        ``plan`` is "pro" or "team". It travels as ``plan_id``, which is the
+        field the endpoint reads.
+        """
+        if not plan:
+            raise CagedError("plan is required; it is 'pro' or 'team'")
+        data = self._client._request_json(
+            "POST", "/billing/checkout", json={"plan_id": plan}
+        )
+        return _url_from(data, "POST /billing/checkout")
 
     def create_portal(self) -> str:
-        """Create a Stripe billing portal session. Returns portal URL."""
-        data = self._client._request("POST", "/billing/portal")
-        return data["url"]
+        """Create a Stripe billing portal session and return its URL."""
+        data = self._client._request_json("POST", "/billing/portal", json={})
+        return _url_from(data, "POST /billing/portal")
 
     def cancel(self) -> None:
-        """Cancel the current subscription."""
-        self._client._request("POST", "/billing/cancel")
-
-    def restore(self, snapshot_id: str) -> None:
-        """Restore a snapshot into its sandbox."""
-        self._client._request("POST", f"/snapshots/{snapshot_id}/restore")
+        """Cancel the subscription at the end of the current period."""
+        self._client._request_none("POST", "/billing/cancel")
 
 
-class _AccountAPI:
-    def __init__(self, client: Caged) -> None:
-        self._client = client
+def _url_from(data: Any, what: str) -> str:
+    if not isinstance(data, Mapping) or not isinstance(data.get("url"), str):
+        raise CagedError(f"{what} did not return a url")
+    return str(data["url"])
 
-    def list_keys(self) -> list[APIKey]:
-        """List API keys."""
-        data = self._client._request("GET", "/account/keys")
-        return [APIKey(**k) for k in data]
 
-    def create_key(self, name: str) -> dict[str, Any]:
-        """Create a new API key. Returns the key (only shown once)."""
-        return self._client._request("POST", "/account/keys", json={"name": name})
+def _seg(value: str) -> str:
+    """Quote a value for use as a single URL path segment."""
+    return quote(str(value), safe="")
 
-    def revoke_key(self, id: str) -> None:
-        """Revoke an API key."""
-        self._client._request("DELETE", f"/account/keys/{id}")
 
-    def list_sessions(self) -> list[Session]:
-        """List active sessions."""
-        data = self._client._request("GET", "/account/sessions")
-        return [Session(**s) for s in data]
-
-    def revoke_session(self, id: str) -> None:
-        """Revoke a session."""
-        self._client._request("DELETE", f"/account/sessions/{id}")
+def _deprecated(message: str) -> None:
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
