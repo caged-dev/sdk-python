@@ -67,3 +67,22 @@ def test_the_python_floor_and_the_ci_matrix_agree() -> None:
     assert floor.startswith(">=")
     lowest = floor.removeprefix(">=").strip()
     assert f"'{lowest}'" in CI, f"CI does not test the declared floor {lowest}"
+
+
+PUBLISH = (ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+
+
+def test_publishing_does_not_edit_the_version_into_the_source() -> None:
+    # A version written in by CI at publish time belongs to no commit, and
+    # the sed that did it had stopped matching anything anyway.
+    assert "sed -i" not in PUBLISH
+
+
+def test_publishing_runs_the_tests_and_inspects_the_artifact() -> None:
+    assert "pytest" in PUBLISH
+    assert "verify_wheel.py" in PUBLISH
+
+
+def test_publishing_uses_trusted_publishing() -> None:
+    assert "id-token: write" in PUBLISH
+    assert "PYPI_API_TOKEN" not in PUBLISH
