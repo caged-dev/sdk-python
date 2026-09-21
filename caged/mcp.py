@@ -29,13 +29,19 @@ from typing import Any, TypeVar
 
 from caged._version import __version__
 from caged._ws import WebSocketLike
+from caged.errors import CagedError
 from caged.stream import _is_connection_closed
 
 M = TypeVar("M", bound="_MCPModel")
 
 
-class MCPError(Exception):
-    """Error returned by the MCP server."""
+class MCPError(CagedError):
+    """Error returned by the MCP server, as a JSON-RPC error object.
+
+    Subclasses :class:`~caged.errors.CagedError` so that "every failure this
+    SDK raises is a CagedError" is true of the socket clients too, rather
+    than only of the HTTP ones.
+    """
 
     def __init__(self, code: int, message: str) -> None:
         self.code = code

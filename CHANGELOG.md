@@ -133,6 +133,8 @@ Warned, not removed; all of these stay until at least 0.5.0.
   `CagedServerError`, `CagedConnectionError`, `CagedTimeoutError`. The API
   ones subclass `CagedAPIError`, so an existing `except CagedAPIError` still
   catches them.
+- `MCPError` now subclasses `CagedError`, so `except CagedError` covers the
+  socket clients too and not only the HTTP ones.
 - `sandboxes.logs(id, tail=None)`, `account.get()`, `sessions.list(page)`,
   `snapshots.download()`, `billing.get_usage()`,
   `notifications.list_unread()`, `caged.socket_ticket()`.

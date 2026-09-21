@@ -328,3 +328,11 @@ async def test_mcp_notifications_reach_their_handler() -> None:
         await asyncio.sleep(0)
     assert seen == [("notifications/progress", {"n": 1})]
     await client.close()
+
+
+def test_an_mcp_error_is_a_caged_error() -> None:
+    # So `except CagedError` covers the socket clients too, not only HTTP.
+    from caged import CagedError
+
+    assert issubclass(MCPError, CagedError)
+    assert isinstance(MCPError(-32601, "no such tool"), CagedError)
