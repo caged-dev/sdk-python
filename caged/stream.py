@@ -84,6 +84,9 @@ class ExecStream:
                 self._error = exc
         finally:
             self._done = True
+            tail = self._filter.flush()
+            if tail:
+                await self._queue.put(tail)
             await self._queue.put(None)
             # The shell has exited, or the socket has gone; either way the
             # connection is finished with. Closing here rather than leaving
@@ -242,3 +245,26 @@ class _MarkerFilter:
         self._finished = True
         self._buf = ""
         return out, True
+
+    def flush(self) -> str:
+        """Whatever is still held back when the stream ends unfinished.
+
+        Output is deliberately held back so a marker straddling two frames is
+        still recognised, which means that at the moment a socket drops the
+        last few hundred characters the user did see are still in this
+        buffer. Dropping them lost the tail of every interrupted command --
+        and for a command whose entire output was shorter than the held-back
+        window, it lost all of it.
+
+        A trailing fragment that could be the beginning of the end marker is
+        not emitted: it is protocol, not output.
+        """
+        if self._finished or not self._started:
+            self._buf = ""
+            return ""
+        out = self._buf
+        self._buf = ""
+        for cut in range(len(self._end) - 1, 0, -1):
+            if out.endswith(self._end[:cut]):
+                return out[:-cut]
+        return out

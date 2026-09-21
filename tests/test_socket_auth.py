@@ -9,6 +9,8 @@ API key on every socket.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -21,15 +23,53 @@ from caged import _ws as ws_module
 TICKET = {"ticket": "caged_wst_abc.def", "expires_in": 60, "expires_at": "t"}
 
 
+class AnsweringWS:
+    """A socket that answers any JSON-RPC request with an empty result.
+
+    The MCP client performs a real ``initialize`` round trip as part of
+    connecting, so a handshake test needs a socket that can complete one.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.closed = False
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+        request = json.loads(message)
+        if "id" in request:
+            self._queue.put_nowait(
+                json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+            )
+
+    async def close(self) -> None:
+        self.closed = True
+        self._queue.put_nowait(None)
+
+    def __aiter__(self) -> Any:
+        return self._frames()
+
+    async def _frames(self) -> Any:
+        while True:
+            frame = await self._queue.get()
+            if frame is None:
+                return
+            yield frame
+
+
 class RecordingConnect:
     def __init__(self) -> None:
         self.url = ""
         self.subprotocol = ""
+        self.sockets: list[AnsweringWS] = []
 
     async def __call__(self, url: str, subprotocol: str) -> Any:
         self.url = url
         self.subprotocol = subprotocol
-        return object()
+        socket = AnsweringWS()
+        self.sockets.append(socket)
+        return socket
 
 
 @pytest.fixture

@@ -81,15 +81,34 @@ def test_marker_filter_survives_a_marker_split_across_frames() -> None:
     # The reason output is held back rather than emitted straight through: a
     # PTY read boundary can land in the middle of a marker.
     f = _MarkerFilter(begin="BEGIN", end="EXIT")
-    f.feed("noise BEG")
-    out, done = f.feed("IN\nreal output\n")
-    assert done is False
-    f.feed("more\nEX")
-    out2, done2 = f.feed("IT0\n")
-    assert done2 is True
+    collected = ""
+    for chunk in ("noise BEG", "IN\nreal output\n", "more\nEX", "IT0\n"):
+        out, done = f.feed(chunk)
+        collected += out
+    assert done is True
     assert f.exit_code == 0
-    assert (out + out2).endswith("more\n")
-    assert "real output\n" in out + out2
+    assert collected == "real output\nmore\n"
+
+
+def test_marker_filter_flushes_held_back_output_when_the_stream_ends() -> None:
+    # Output is held back to catch a split marker, so at the moment a socket
+    # drops the tail the user saw is still in the buffer. It has to come out.
+    f = _MarkerFilter(begin="BEGIN", end="EXIT")
+    out, _ = f.feed("BEGIN\nshort\n")
+    assert out == ""
+    assert f.flush() == "short\n"
+
+
+def test_marker_filter_does_not_flush_a_partial_end_marker_as_output() -> None:
+    f = _MarkerFilter(begin="BEGIN", end="EXIT")
+    f.feed("BEGIN\ndone\nEX")
+    assert f.flush() == "done\n"
+
+
+def test_marker_filter_flushes_nothing_before_the_first_marker() -> None:
+    f = _MarkerFilter(begin="BEGIN", end="EXIT")
+    f.feed("login banner\n")
+    assert f.flush() == ""
 
 
 def test_marker_filter_waits_for_the_exit_digits() -> None:
