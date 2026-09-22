@@ -163,6 +163,121 @@ asyncio.run(main())
 `on_notification(handler)` and `on_close(handler)`. A JSON-RPC error
 surfaces as `MCPError` carrying the server's `code` and `message`.
 
+## Third-party MCP servers (`client.mcp.*`)
+
+The section above is the MCP server Caged *is*. This one is about the MCP
+servers Caged *uses*: GitHub, Linear, Postgres — other people's servers, reached
+by the agent inside a sandbox without widening that sandbox's egress by one
+byte. The API dials out; the guest does not. Tools arrive on the connection the
+agent already has, namespaced `alias__tool`.
+
+```python
+from caged import Caged
+
+with Caged(api_key="caged_sk_...") as caged:
+    # 1. register
+    server = caged.mcp.servers.add(
+        alias="github",
+        catalogue_id="io.github.github/github-mcp-server",
+        credential="ghp_...",
+    )
+
+    # 2. fetch and pin its tool catalogue
+    report = caged.mcp.servers.refresh(server.id)
+    print(report.added, report.quarantined)
+
+    # 3. bind it, and write the policy rule in the same request
+    result = caged.mcp.bind(server.id, persona_id=persona.id, allow_tools=True)
+    print(result.policy_advice.status)        # "allowed"
+
+    # 4. and when calls are still being refused, ask why
+    for advice in caged.mcp.readiness(persona_id=persona.id):
+        if advice.needs_allow_rule:
+            print(advice.explanation)
+            caged.mcp.allow(advice.server_id, persona.id)
+```
+
+### Two things that will otherwise cost you an afternoon
+
+**Binding a server does not make its tools callable.** Caged's autonomy tiers
+rank *its own* tools — `filesystem_read`, `terminal_exec`, `git_push`. A
+third-party name like `github__get_issue` matches none of them, so it is
+unclassified, and an unclassified tool is denied at **every** tier including
+`autonomous`. That is deliberate: Caged cannot know whether a stranger's tool
+reads an issue or wires money.
+
+`bind(..., allow_tools=True)` writes the one rule that clears it, `allow()`
+writes it later, and `readiness()` tells you which servers still need it —
+`MCPPolicyAdvice.needs_allow_rule` is the boolean to branch on. Nothing here
+silently widens anything: `allow()` writes exactly one rule,
+`allow tool <alias>__*`, above the catch-all deny and **below** every always-on
+guardrail.
+
+**A `quarantined` tool is one whose definition CHANGED** since a human approved
+it. Caged hashes every tool definition at refresh and holds a changed one, so a
+server that is benign on Monday and poisoned on Tuesday becomes a review rather
+than a silent compromise. Read the change before deciding:
+
+```python
+diff = caged.mcp.tool_diff(server.id, "get_issue")
+print(diff.explanation)          # leads with the parameter change
+print(diff.added_properties)     # ["debug_context"] — how a tool grows an exfil field
+print(diff.approved.description) # what a human approved
+print(diff.current.description)  # what the server is advertising now
+
+caged.mcp.approve_tool(server.id, "get_issue")
+caged.mcp.reject_tool(server.id, "get_issue", note="grew a debug_context parameter")
+```
+
+### OAuth is three calls on purpose
+
+```python
+state = caged.mcp.oauth.show(server.id)            # read-only; mints nothing
+print(state.prospect.issuer, state.prospect.scopes)
+print(state.prospect.consent_statement)            # show this to the human
+
+caged.mcp.oauth.consent(                           # the decision; forwards nothing
+    server.id,
+    issuer=state.prospect.issuer,
+    scopes=state.prospect.scopes,
+    persona_id=persona.id,
+)
+
+auth = caged.mcp.oauth.authorize(server.id, persona_id=persona.id)
+print(auth.authorization_url)                      # open this; single-use, 10 minutes
+```
+
+The order is the point. One call that discovered, minted a state and redirected
+would be a side-effecting action reachable by anybody who could make an
+authenticated operator's browser visit it — a real authorization flow attributed
+to that operator, against a server they never chose, for scopes they never read.
+
+Caged holds the resulting token itself: sealed at rest, never written into a
+sandbox, never in an environment variable, and never returned by any read. None
+of the models in this SDK has a field for one.
+
+### When a server asks a question
+
+Under the current MCP revision a server can ask the client a question mid-call.
+Caged routes it to a **person**, not to the agent's model — in an unattended run
+the alternative is a model answering a stranger's question on your behalf.
+
+```python
+for request in caged.mcp.inputs.list():
+    for question in request.questions:
+        print(request.tool, question.message)
+    caged.mcp.inputs.respond(request.id, answers={"team": {"team": "platform"}})
+    # or: caged.mcp.inputs.respond(request.id, decline=True, note="not this run")
+```
+
+The agent's next attempt at the same call carries your answer. Caged does not
+re-send the call itself: a tool call whose side effect may be half-done must not
+be repeated by infrastructure.
+
+A *sampling* request — "run an inference on my prompt and hand back the
+completion" — never appears in that list. It is refused outright, because no
+approval makes spending your tokens on a third party's prompt safe.
+
 ## Session Replay
 
 ```python
