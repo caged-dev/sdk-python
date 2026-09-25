@@ -25,6 +25,7 @@ from dataclasses import fields
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from conftest import Harness, Stub
 
 from caged import (
     CagedError,
@@ -36,8 +37,6 @@ from caged import (
     MCPServerDetail,
     MCPToolDiff,
 )
-
-from conftest import Harness, Stub
 
 SERVER_BODY = {
     "id": "0f4c1b2e-0000-0000-0000-000000000001",
