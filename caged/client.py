@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -40,6 +40,21 @@ from caged.types import (
     GitDiff,
     IngestResponse,
     LogEntry,
+    MCPBinding,
+    MCPBindResult,
+    MCPCatalogueEntry,
+    MCPGrantResult,
+    MCPInputRequest,
+    MCPOAuthAuthorization,
+    MCPOAuthConsent,
+    MCPOAuthState,
+    MCPPolicyAdvice,
+    MCPRefreshReport,
+    MCPServer,
+    MCPServerDetail,
+    MCPServerTool,
+    MCPToolDiff,
+    MCPToolRevision,
     Notification,
     NotificationConfig,
     NotificationConfigUpdate,
@@ -116,6 +131,7 @@ class Caged:
         self.alerts = _AlertsAPI(self)
         self.notifications = _NotificationsAPI(self)
         self.billing = _BillingAPI(self)
+        self.mcp = _MCPAPI(self)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -814,3 +830,535 @@ def _seg(value: str) -> str:
 
 def _deprecated(message: str) -> None:
     warnings.warn(message, DeprecationWarning, stacklevel=3)
+
+
+class _MCPAPI:
+    """``client.mcp`` — third-party MCP servers an agent in a sandbox can use.
+
+    Two facts about this surface are worth reading before the methods, because
+    each is the difference between a working setup and a silent one, and neither
+    is visible from a successful HTTP response:
+
+    **Binding a server does not make its tools callable.** Caged's
+    autonomy-tier table classifies its *own* tool names — ``filesystem_read``,
+    ``terminal_exec``, ``git_push``. A brokered name like ``github__get_issue``
+    matches none of them, so it is unclassified, and an unclassified tool is
+    denied at **every** tier including ``autonomous``. That default is
+    deliberate: Caged cannot know whether a stranger's tool reads an issue or
+    wires money.
+
+    :meth:`bind` returns the advice on its result, ``allow_tools=True`` writes
+    the rule in the same request, :meth:`allow` writes it later, and
+    :meth:`readiness` answers for every bound server at once.
+
+    **A ``quarantined`` tool is a definition that CHANGED** since a human
+    approved it. Caged hashes every tool definition at refresh and holds a
+    changed one, so a server that is benign on Monday and poisoned on Tuesday
+    becomes a review rather than a silent compromise. :meth:`tool_diff` shows
+    the approved definition beside the current one; approving without reading it
+    is the outcome the mechanism exists to prevent.
+
+    Nothing here returns a credential or a token. The models have no field for
+    one.
+    """
+
+    def __init__(self, client: Caged) -> None:
+        self._client = client
+        self.servers = _MCPServersAPI(client)
+        self.bindings = _MCPBindingsAPI(client)
+        self.oauth = _MCPOAuthAPI(client)
+        self.inputs = _MCPInputsAPI(client)
+
+    # --- shortcuts, because these are the three an operator reaches for ---
+
+    def catalogue(self) -> builtins.list[MCPCatalogueEntry]:
+        """List the servers Caged has reviewed.
+
+        A server registered from this catalogue is ``verified`` and its tools
+        arrive usable. One registered from an arbitrary URL is not, and its
+        tools are held for review.
+        """
+        data = self._client._request_json("GET", "/mcp/catalogue")
+        if isinstance(data, Mapping):
+            data = data.get("servers")
+        return MCPCatalogueEntry.list_from_api(data)
+
+    def bind(
+        self,
+        server_id: str,
+        persona_id: str | None = None,
+        tools: Sequence[str] | None = None,
+        deny: Sequence[str] | None = None,
+        pinned: bool = False,
+        argument_ceiling_bytes: int = 0,
+        allow_tools: bool = False,
+    ) -> MCPBindResult:
+        """Make a server's tools visible to a subject.
+
+        ``persona_id`` ``None`` binds at the account, which every persona sees.
+
+        ``allow_tools`` also writes the policy rule that makes those tools
+        callable. It defaults to ``False`` on purpose: binding a server and
+        granting its tools are two decisions, and folding them together by
+        default would make "I bound it to look at its catalogue" mean "I allowed
+        it". What was wrong before was not that the grant was separate — it was
+        that it was invisible, which is why the RESULT always carries
+        :attr:`MCPBindResult.policy_advice`.
+        """
+        return self.bindings.create(
+            server_id,
+            persona_id=persona_id,
+            tools=tools,
+            deny=deny,
+            pinned=pinned,
+            argument_ceiling_bytes=argument_ceiling_bytes,
+            allow_tools=allow_tools,
+        )
+
+    def unbind(self, binding_id: str) -> None:
+        """Remove a binding. It takes effect on the agent's next ``tools/list``."""
+        self.bindings.delete(binding_id)
+
+    def tools(self, server_id: str) -> builtins.list[MCPServerTool]:
+        """The pinned tool catalogue for one server, as an agent sees it."""
+        return self.servers.get(server_id).tools
+
+    def readiness(self, persona_id: str | None = None) -> builtins.list[MCPPolicyAdvice]:
+        """Whether policy will allow each bound server's tools for a persona.
+
+        This is the call to make when brokered calls are being refused and it is
+        not obvious why. Every entry carries a ``status`` from a closed set, the
+        deciding rule, and a ``remedy``.
+
+        ``status`` is never reported as ``allowed`` when the answer could not be
+        determined: an unresolvable policy is ``unknown``, because a readiness
+        screen that renders a resolution failure as a green tick is worse than
+        one that renders nothing.
+        """
+        params = {"persona_id": persona_id} if persona_id else None
+        data = self._client._request_json("GET", "/mcp/readiness", params=params)
+        if isinstance(data, Mapping):
+            data = data.get("servers")
+        return MCPPolicyAdvice.list_from_api(data)
+
+    def advice(self, server_id: str, persona_id: str | None = None) -> MCPPolicyAdvice:
+        """Whether policy will allow one server's tools for a persona."""
+        params = {"persona_id": persona_id} if persona_id else None
+        return MCPPolicyAdvice.from_api(
+            self._client._request_json(
+                "GET", f"/mcp/servers/{_seg(server_id)}/advice", params=params
+            )
+        )
+
+    def allow(self, server_id: str, persona_id: str) -> MCPGrantResult:
+        """Write the one policy rule that makes a server's tools callable.
+
+        The rule is ``allow tool <alias>__*`` at glob priority: above the
+        catch-all deny and **below** every always-on guardrail, so allowing an
+        external server can never override the secret-path or private-network
+        rules.
+
+        ``persona_id`` is required, and not as an oversight. Caged's account
+        policy layer is restriction-only — it decides only on an explicit deny or
+        pause and otherwise allows by default — so an allow rule written there
+        would be stored, displayed, and have no effect whatsoever.
+
+        If the persona has no stored policy, Caged creates one as an exact copy
+        of its tier template plus this rule, and says so in
+        :attr:`MCPGrantResult.policy_created`. A policy containing only the allow
+        rule would silently drop every guardrail the template carries, because a
+        stored persona policy *replaces* the template rather than layering over
+        it.
+
+        Idempotent: a second call reports :attr:`MCPGrantResult.already_present`.
+        """
+        if not persona_id:
+            raise CagedError(
+                "persona_id is required: an allow rule for an external MCP server lives "
+                "on a persona's policy, because Caged's account policy layer can only "
+                "restrict and never grant"
+            )
+        return MCPGrantResult.from_api(
+            self._client._request_json(
+                "POST",
+                f"/mcp/servers/{_seg(server_id)}/allow",
+                json={"persona_id": persona_id},
+            )
+        )
+
+    def disallow(self, server_id: str, persona_id: str) -> None:
+        """Remove the rule Caged wrote.
+
+        Only that rule. A rule you wrote yourself that happens to allow the same
+        pattern is left alone — deleting somebody else's rule for looking like
+        ours turns an undo into an outage.
+        """
+        if not persona_id:
+            raise CagedError("persona_id is required")
+        self._client._request_none(
+            "DELETE",
+            f"/mcp/servers/{_seg(server_id)}/allow",
+            params={"persona_id": persona_id},
+        )
+
+    def tool_diff(self, server_id: str, tool: str) -> MCPToolDiff:
+        """The definition a human approved, beside the one being advertised now.
+
+        Read this before :meth:`approve_tool`. A review with one side is a
+        consent dialog with the text removed, and it trains a reviewer to click
+        approve.
+        """
+        return MCPToolDiff.from_api(
+            self._client._request_json(
+                "GET", f"/mcp/servers/{_seg(server_id)}/tools/{_seg(tool)}/diff"
+            )
+        )
+
+    def tool_revisions(self, server_id: str, tool: str) -> builtins.list[MCPToolRevision]:
+        """Every definition this server has advertised for this tool.
+
+        Keyed by digest, so a server that reverts to a previously approved
+        definition produces no second review, and a rejection survives a server
+        re-advertising the same bytes on a loop.
+        """
+        data = self._client._request_json(
+            "GET", f"/mcp/servers/{_seg(server_id)}/tools/{_seg(tool)}/revisions"
+        )
+        if isinstance(data, Mapping):
+            data = data.get("revisions")
+        return MCPToolRevision.list_from_api(data)
+
+    def approve_tool(self, server_id: str, tool: str) -> None:
+        """Release a pending or quarantined tool.
+
+        Refused with a conflict if the definition carries an ``injection`` or
+        ``shadowing`` flag: approving prompt-injected metadata is the exact
+        outcome the mechanism exists to prevent, so it is not one click.
+        """
+        self._client._request_none(
+            "POST", f"/mcp/servers/{_seg(server_id)}/tools/{_seg(tool)}/approve"
+        )
+
+    def reject_tool(self, server_id: str, tool: str, note: str = "") -> None:
+        """Refuse a held definition, durably.
+
+        The tool stays unavailable to every agent, and the refusal is recorded
+        against this exact definition — so a server re-advertising the same bytes
+        does not re-open the review.
+        """
+        self._client._request_none(
+            "POST",
+            f"/mcp/servers/{_seg(server_id)}/tools/{_seg(tool)}/reject",
+            json={"note": note},
+        )
+
+
+class _MCPServersAPI:
+    """``client.mcp.servers`` — registrations."""
+
+    def __init__(self, client: Caged) -> None:
+        self._client = client
+
+    def add(
+        self,
+        alias: str | None = None,
+        endpoint: str | None = None,
+        catalogue_id: str | None = None,
+        display_name: str | None = None,
+        description: str | None = None,
+        auth_kind: str | None = None,
+        credential: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> MCPServer:
+        """Register a third-party MCP server.
+
+        Registering makes a server **known**. It is visible to nothing until it
+        is bound, and its tools are denied by policy until a rule allows them:
+        the default visible set for an agent is empty, and that is the design
+        rather than a safety net.
+
+        ``credential`` is sealed by the API immediately and is never returned by
+        any read. ``auth_kind="oauth"`` stores no credential at all — the token
+        comes from a human completing the consent flow in
+        :attr:`_MCPAPI.oauth`, and the result's
+        :attr:`MCPServer.oauth_next_step` names it.
+        """
+        if not catalogue_id and not endpoint:
+            raise CagedError(
+                "one of catalogue_id or endpoint is required; "
+                "client.mcp.catalogue() lists the reviewed servers"
+            )
+        body: dict[str, Any] = {}
+        for key, value in (
+            ("alias", alias),
+            ("endpoint", endpoint),
+            ("catalogue_id", catalogue_id),
+            ("display_name", display_name),
+            ("description", description),
+            ("auth_kind", auth_kind),
+            ("credential", credential),
+        ):
+            if value:
+                body[key] = value
+        if headers:
+            body["headers"] = dict(headers)
+            body.setdefault("auth_kind", "header")
+        if credential and "auth_kind" not in body:
+            body["auth_kind"] = "bearer"
+        return MCPServer.from_api(
+            self._client._request_json("POST", "/mcp/servers", json=body)
+        )
+
+    def list(self) -> builtins.list[MCPServer]:
+        """List the account's registrations."""
+        data = self._client._request_json("GET", "/mcp/servers")
+        if isinstance(data, Mapping):
+            data = data.get("servers")
+        return MCPServer.list_from_api(data)
+
+    def get(self, server_id: str) -> MCPServerDetail:
+        """One registration and its pinned tool catalogue."""
+        return MCPServerDetail.from_api(
+            self._client._request_json("GET", f"/mcp/servers/{_seg(server_id)}")
+        )
+
+    def remove(self, server_id: str) -> None:
+        """Deregister a server, its catalogue and every binding to it."""
+        self._client._request_none("DELETE", f"/mcp/servers/{_seg(server_id)}")
+
+    def refresh(self, server_id: str) -> MCPRefreshReport:
+        """Re-fetch the server's tool catalogue and report what changed.
+
+        A definition whose digest differs from the stored one is
+        **quarantined**, not merged: it is advertised to no agent and fails the
+        gate until a human decides. Read
+        :attr:`MCPRefreshReport.quarantined` and then
+        :meth:`_MCPAPI.tool_diff`.
+        """
+        return MCPRefreshReport.from_api(
+            self._client._request_json("POST", f"/mcp/servers/{_seg(server_id)}/refresh")
+        )
+
+
+class _MCPBindingsAPI:
+    """``client.mcp.bindings`` — who sees which server."""
+
+    def __init__(self, client: Caged) -> None:
+        self._client = client
+
+    def create(
+        self,
+        server_id: str,
+        persona_id: str | None = None,
+        tools: Sequence[str] | None = None,
+        deny: Sequence[str] | None = None,
+        pinned: bool = False,
+        argument_ceiling_bytes: int = 0,
+        allow_tools: bool = False,
+    ) -> MCPBindResult:
+        """Bind a server to a persona, or to the account."""
+        body: dict[str, Any] = {
+            "server_id": server_id,
+            "subject_kind": "persona" if persona_id else "account",
+        }
+        if persona_id:
+            body["subject_id"] = persona_id
+        if tools:
+            body["tool_allowlist"] = list(tools)
+        if deny:
+            body["tool_denylist"] = list(deny)
+        if pinned:
+            body["pinned"] = True
+        if argument_ceiling_bytes:
+            body["argument_ceiling_bytes"] = argument_ceiling_bytes
+        if allow_tools:
+            # Omitted rather than sent as false, so a server that ever changes
+            # its default is not overridden by a client that did not mean to.
+            body["allow_tools"] = True
+        return MCPBindResult.from_api(
+            self._client._request_json("POST", "/mcp/bindings", json=body)
+        )
+
+    def list(self) -> builtins.list[MCPBinding]:
+        """List the account's bindings."""
+        data = self._client._request_json("GET", "/mcp/bindings")
+        if isinstance(data, Mapping):
+            data = data.get("bindings")
+        return MCPBinding.list_from_api(data)
+
+    def delete(self, binding_id: str) -> None:
+        """Remove a binding."""
+        self._client._request_none("DELETE", f"/mcp/bindings/{_seg(binding_id)}")
+
+
+class _MCPOAuthAPI:
+    """``client.mcp.oauth`` — authorizing a server, consent first.
+
+    The order of these three calls **is** the security property, so they are
+    three calls rather than one:
+
+    1. :meth:`show` — read-only. Says which authorization server a browser would
+       be sent to and which scopes are being asked for. Mints nothing.
+    2. :meth:`consent` — records the human decision. Forwards nothing.
+    3. :meth:`authorize` — requires a live consent, and only then mints a
+       single-use state and returns the URL to open.
+
+    One call that discovered, minted and redirected would be a side-effecting
+    action reachable by anybody who could make an authenticated operator's
+    browser visit it: a real authorization flow attributed to that operator,
+    against a server they never chose, for scopes they never read. Caged is a
+    proxy holding credentials for many upstreams on behalf of many subjects,
+    which is the exact position that attack is described from.
+
+    Caged holds the resulting token itself: sealed at rest, never written into a
+    sandbox, never in an environment variable, and never returned by any read.
+    """
+
+    def __init__(self, client: Caged) -> None:
+        self._client = client
+
+    def show(self, server_id: str) -> MCPOAuthState:
+        """What is authorized, and what authorizing would involve.
+
+        Read-only. If discovery fails,
+        :attr:`MCPOAuthState.discovery_error` is set and
+        :attr:`MCPOAuthState.status` is still real: what is authorized remains
+        true when a third party's metadata endpoint is down.
+        """
+        return MCPOAuthState.from_api(
+            self._client._request_json("GET", f"/mcp/servers/{_seg(server_id)}/oauth")
+        )
+
+    def consent(
+        self,
+        server_id: str,
+        issuer: str,
+        scopes: Sequence[str],
+        persona_id: str | None = None,
+    ) -> MCPOAuthConsent:
+        """Record the human decision. Nothing is forwarded to the third party.
+
+        ``persona_id`` ``None`` records an ACCOUNT-wide consent, which is a real
+        and different decision: making an operator record the same one per
+        persona is how a consent record becomes a rubber stamp. A persona's own
+        consent outranks the account-wide one.
+
+        Show :attr:`MCPOAuthProspect.consent_statement` to the human first. A
+        consent recorded from a discovered value nobody read is not a consent.
+        """
+        if not issuer:
+            raise CagedError(
+                "issuer is required: a consent names the authorization server it is for, "
+                "and a server that later names a different one needs a new consent"
+            )
+        body: dict[str, Any] = {
+            "approve": True,
+            "issuer": issuer,
+            "scopes": list(scopes),
+        }
+        if persona_id:
+            # Omitted rather than sent empty: the API reads an empty string as a
+            # malformed UUID, not as "account-wide".
+            body["persona_id"] = persona_id
+        data = self._client._request_json(
+            "POST", f"/mcp/servers/{_seg(server_id)}/oauth/consent", json=body
+        )
+        if isinstance(data, Mapping) and "consent" in data:
+            data = data["consent"]
+        return MCPOAuthConsent.from_api(data or {})
+
+    def authorize(self, server_id: str, persona_id: str | None = None) -> MCPOAuthAuthorization:
+        """The URL to open. Requires a recorded consent.
+
+        Raises a conflict when no live consent covers this subject — that
+        refusal is the confused-deputy mitigation, not a missing feature — and
+        when the recorded consent does not cover a scope the server now
+        requires, naming the missing scope.
+        """
+        body: dict[str, Any] = {}
+        if persona_id:
+            body["persona_id"] = persona_id
+        return MCPOAuthAuthorization.from_api(
+            self._client._request_json(
+                "POST", f"/mcp/servers/{_seg(server_id)}/oauth/authorize", json=body
+            )
+        )
+
+    def forget(self, server_id: str) -> None:
+        """Delete the stored token.
+
+        The consent is kept: disconnecting and withdrawing permission are
+        different decisions, and conflating them would make a reconnect silently
+        permitted. Use :meth:`revoke_consent` for the other one.
+        """
+        self._client._request_none("DELETE", f"/mcp/servers/{_seg(server_id)}/oauth")
+
+    def revoke_consent(self, server_id: str, consent_id: str) -> None:
+        """Withdraw a recorded consent."""
+        self._client._request_none(
+            "DELETE",
+            f"/mcp/servers/{_seg(server_id)}/oauth/consent",
+            params={"consent_id": consent_id},
+        )
+
+
+class _MCPInputsAPI:
+    """``client.mcp.inputs`` — questions servers asked, waiting on a person.
+
+    Under the current MCP revision a server can ask the client a question
+    mid-call. Caged routes it to a **human** rather than to the agent's model: in
+    an unattended run the alternative is a model answering a stranger's question
+    on somebody's behalf, which is what every other MCP client does.
+
+    A *sampling* request — "run an inference on my prompt and hand back the
+    completion" — never appears here. It is refused outright, because no approval
+    makes spending the account's tokens on a third party's prompt safe.
+    """
+
+    def __init__(self, client: Caged) -> None:
+        self._client = client
+
+    def list(self) -> builtins.list[MCPInputRequest]:
+        """The questions waiting on a person."""
+        data = self._client._request_json("GET", "/mcp/inputs")
+        if isinstance(data, Mapping):
+            data = data.get("inputs")
+        return MCPInputRequest.list_from_api(data)
+
+    def get(self, input_id: str) -> MCPInputRequest:
+        """One question set."""
+        return MCPInputRequest.from_api(
+            self._client._request_json("GET", f"/mcp/inputs/{_seg(input_id)}")
+        )
+
+    def respond(
+        self,
+        input_id: str,
+        answers: Mapping[str, Any] | None = None,
+        decline: bool = False,
+        note: str = "",
+    ) -> None:
+        """Answer a server's question, or decline it.
+
+        ``answers`` maps a question id to the JSON value that answers it.
+
+        The agent's **next attempt at the same call** carries the answer to the
+        server. Caged does not re-send the call itself: a tool call whose side
+        effect may be half-done must not be repeated by infrastructure.
+
+        A decline is a first-class answer, forwarded once as a real ``decline``,
+        so a server that asked is told no rather than left waiting.
+        """
+        if not decline and not answers:
+            raise CagedError("answers or decline=True is required")
+        body: dict[str, Any] = {"note": note}
+        if decline:
+            body["decline"] = True
+        else:
+            body["answers"] = [
+                {"id": question_id, "content": content}
+                for question_id, content in (answers or {}).items()
+            ]
+        self._client._request_none(
+            "POST", f"/mcp/inputs/{_seg(input_id)}/respond", json=body
+        )
